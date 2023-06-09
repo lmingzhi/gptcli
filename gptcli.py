@@ -42,6 +42,12 @@ class Config:
         self.proxy = c.get("proxy", "")
         self.showtokens = c.get("showtokens", False)
 
+        # azure
+        # =========================================================
+        self.api_type = c.get("api_type", "")
+        self.api_version = c.get("api_version", "")        
+        # =========================================================
+
     def get(self, key, default=None):
         return self.cfg.get(key, default)
 
@@ -73,6 +79,24 @@ class GptCli(cmd2.Cmd):
         if self.config.proxy:
             self.print("Proxy:", self.config.proxy)
             openai.proxy = self.config.proxy
+
+
+        # azure
+        # =========================================================
+        # openai.api_type = "azure"
+        # openai.api_base = os.getenv("AZURE_OPENAI_ENDPOINT") 
+        # openai.api_version = "2023-05-15"
+        # openai.api_key = os.getenv("AZURE_OPENAI_KEY")
+        if self.config.api_type:
+            self.print("api_type:", self.config.api_type)
+            openai.api_type = self.config.api_type
+
+        if self.config.api_version:
+            self.print("api_version:", self.config.api_version)
+            openai.api_version = self.config.api_version
+        # =========================================================
+
+
         self.print("Response in prompt:", self.config.response)
         self.print("Stream mode:", self.config.stream)
         # Init settable
@@ -117,10 +141,21 @@ class GptCli(cmd2.Cmd):
         if not content:
             return
         self.session.append({"role": "user", "content": content})
-        if self.config.stream:
-            answer = self.query_openai_stream(self.messages)
+
+        # azure
+        # =========================================================
+        if self.config.api_type == 'azure':
+            if self.config.stream:
+                answer = self.query_azure_stream(self.messages)
+            else:
+                answer = self.query_azure(self.messages)
         else:
-            answer = self.query_openai(self.messages)
+            if self.config.stream:
+                answer = self.query_openai_stream(self.messages)
+            else:
+                answer = self.query_openai(self.messages)
+        # =========================================================
+
         if not answer:
             self.session.pop()
         else:
@@ -173,7 +208,11 @@ class GptCli(cmd2.Cmd):
             encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             encoding = tiktoken.get_encoding("cl100k_base")
-        if model == "gpt-3.5-turbo":  # note: future models may deviate from this
+
+
+        # azure
+        # =========================================================
+        try:
             num_tokens = 0
             for message in messages:
                 num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
@@ -183,9 +222,27 @@ class GptCli(cmd2.Cmd):
                         num_tokens += -1  # role is always required and always 1 token
             num_tokens += 2  # every reply is primed with <im_start>assistant
             return num_tokens
-        else:
+        except Exception as e:
+            # return 0
             raise NotImplementedError(f"""num_tokens_from_messages() is not presently implemented for model {model}.
         See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens.""")
+        # =========================================================
+
+        # if model == "gpt-3.5-turbo":  # note: future models may deviate from this
+        #     num_tokens = 0
+        #     for message in messages:
+        #         num_tokens += 4  # every message follows <im_start>{role/name}\n{content}<im_end>\n
+        #         for key, value in message.items():
+        #             num_tokens += len(encoding.encode(value))
+        #             if key == "name":  # if there's a name, the role is omitted
+        #                 num_tokens += -1  # role is always required and always 1 token
+        #     num_tokens += 2  # every reply is primed with <im_start>assistant
+        #     return num_tokens
+        # else:
+        #     raise NotImplementedError(f"""num_tokens_from_messages() is not presently implemented for model {model}.
+        # See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens.""")
+
+        # =========================================================
 
     def query_openai(self, messages) -> str:
         try:
@@ -233,6 +290,58 @@ class GptCli(cmd2.Cmd):
         self.single_tokens_used = self.num_tokens_from_messages(messages)
         self.total_tokens_used += self.single_tokens_used
         return answer
+
+
+
+    # azure
+    # ============================================================
+    def query_azure(self, messages) -> str:
+        try:
+            response = openai.ChatCompletion.create(
+                engine=self.config.model,
+                messages=messages
+            )
+            content = response["choices"][0]["message"]["content"]
+            self.print(Markdown(content), Config.sep)
+
+            self.single_tokens_used = response["usage"]["total_tokens"]
+            self.total_tokens_used += self.single_tokens_used
+            return content
+        except openai.error.OpenAIError as e:
+            self.print("OpenAIError:", e)
+        return ""
+
+    def query_azure_stream(self, messages) -> str:
+        answer = ""
+        try:
+            response = openai.ChatCompletion.create(
+                engine=self.config.model,
+                messages=messages,
+                stream=True)
+            with Live(auto_refresh=False, vertical_overflow="visible") as lv:
+                for part in response:
+                    finish_reason = part["choices"][0]["finish_reason"]
+                    if "content" in part["choices"][0]["delta"]:
+                        content = part["choices"][0]["delta"]["content"]
+                        answer += content
+                        if self.config.stream_render:
+                            lv.update(Markdown(answer), refresh=True)
+                        else:
+                            lv.update(answer, refresh=True)
+                    elif finish_reason:
+                        if answer:
+                            lv.update(Markdown(answer), refresh=True)
+
+        except KeyboardInterrupt:
+            self.print("Canceled")
+        except openai.error.OpenAIError as e:
+            self.print("OpenAIError:", e)
+            answer = ""
+        self.print(Config.sep)
+        self.single_tokens_used = self.num_tokens_from_messages(messages)
+        self.total_tokens_used += self.single_tokens_used
+        return answer
+    # ============================================================
 
     parser_ml = argparse_custom.DEFAULT_ARGUMENT_PARSER()
     @with_argparser(parser_ml)
